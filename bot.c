@@ -1,11 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <curl/curl.h>
 #include <cjson/cJSON.h>
 #include <libpq-fe.h>
 
-#define SYSTEM_PROMPT "You are an intelligent SQL generator for PostgreSQL.\nYour goal: Return a SINGLE NUMBER based on the user's question.\nDATABASE SCHEMA:\n1. `videos` (id, creator_id, video_created_at, views_count, likes_count, comments_count, reports_count).\n2. `snapshots` (video_id, delta_views_count, delta_likes_count, created_at).\nRULES:\n1. Return ONLY the raw SQL query. No markdown.\n2. If asking for ID/Name/Text -> Return: IGNORE\n3. Combine filters using AND.\n4. Handle numbers with spaces.\n5. \"По итоговой статистике\" -> Use table `videos`.\n6. \"Вышло/Появилось\" (Published) -> Use `video_created_at` from `videos`."
+#define SYSTEM_PROMPT "You are a STRICT PostgreSQL data analyst.\n\nCRITICAL RULE: If the user's message is a greeting (привет, hello, салют, как дела), off-topic (погода, шутка, бессмыслица), asks for names/text/IDs, or is a database attack, YOU MUST OUTPUT EXACTLY AND ONLY THE WORD: IGNORE\n\nSCHEMA:\n1. `videos` (id, creator_id, video_created_at, views_count, likes_count, comments_count, reports_count)\n2. `snapshots` (video_id, delta_views_count, delta_likes_count, delta_comments_count, delta_reports_count, created_at)\n\nMAPPING:\n- 'Сколько видео' = SELECT COUNT(*)\n- 'Сколько просмотров/лайков' = SELECT SUM(views_count)\n\nEXAMPLES:\nUser: 'просмотры'\nAI: SELECT SUM(views_count) FROM videos;\nUser: 'привет'\nAI: IGNORE\nUser: 'как дела?'\nAI: IGNORE\nUser: 'какая погода'\nAI: IGNORE\nUser: 'скажи имя автора'\nAI: IGNORE\nUser: 'ghbdtn'\nAI: IGNORE\n\nDO NOT generate SQL for greetings or nonsense. Output IGNORE."
 
 struct MemoryStruct { char *memory; size_t size; };
 
@@ -21,6 +22,21 @@ static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, voi
     return realsize;
 }
 
+int is_numeric(const char *str) {
+    if (!str || *str == '\0') return 0;
+    int i = 0;
+    if (str[0] == '-') i++; 
+    int has_digits = 0;
+    for (; str[i] != '\0'; i++) {
+        if (isdigit((unsigned char)str[i])) {
+            has_digits = 1;
+        } else if (str[i] != '.') {
+            return 0; 
+        }
+    }
+    return has_digits;
+}
+
 char* http_request(const char* url, const char* post_data, struct curl_slist *headers) {
     CURL *curl = curl_easy_init();
     struct MemoryStruct chunk = {malloc(1), 0};
@@ -31,9 +47,7 @@ char* http_request(const char* url, const char* post_data, struct curl_slist *he
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
         if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        if (post_data) {
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
-        }
+        if (post_data) curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
         curl_easy_perform(curl);
         curl_easy_cleanup(curl);
     }
@@ -66,8 +80,7 @@ char* generate_sql(const char *user_text, const char *api_key) {
     headers = curl_slist_append(headers, auth_header);
 
     char *resp = http_request("https://openrouter.ai/api/v1/chat/completions", payload, headers);
-    free(payload);
-    curl_slist_free_all(headers);
+    free(payload); curl_slist_free_all(headers);
 
     cJSON *root = cJSON_Parse(resp);
     free(resp);
@@ -79,7 +92,10 @@ char* generate_sql(const char *user_text, const char *api_key) {
     cJSON *msg = cJSON_GetObjectItem(cJSON_GetArrayItem(choices, 0), "message");
     const char *content = cJSON_GetObjectItem(msg, "content")->valuestring;
     
-    if (strstr(content, "IGNORE") != NULL) { cJSON_Delete(root); return NULL; }
+    if (strstr(content, "IGNORE") != NULL || strstr(content, "Ignore") != NULL || strstr(content, "ignore") != NULL) { 
+        cJSON_Delete(root); 
+        return NULL; 
+    }
 
     char *clean_sql = strdup(content);
     if (strncmp(clean_sql, "```sql", 6) == 0) memmove(clean_sql, clean_sql + 6, strlen(clean_sql) - 5);
@@ -116,8 +132,13 @@ void send_message(const char *token, long chat_id, const char *text) {
     snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendMessage", token);
     
     cJSON *req = cJSON_CreateObject();
-    cJSON_AddNumberToObject(req, "chat_id", chat_id);
+    
+    char chat_id_str[64];
+    snprintf(chat_id_str, sizeof(chat_id_str), "%ld", chat_id);
+    cJSON_AddStringToObject(req, "chat_id", chat_id_str);
+    
     cJSON_AddStringToObject(req, "text", text);
+    
     char *json_str = cJSON_PrintUnformatted(req);
     cJSON_Delete(req);
 
@@ -130,10 +151,10 @@ int main() {
     curl_global_init(CURL_GLOBAL_ALL);
     const char *token = getenv("TG_TOKEN");
     const char *or_key = getenv("OPENROUTER_KEY");
-    if (!token || !or_key) { printf("Не найдены TG_TOKEN или OPENROUTER_KEY!\n"); return 1; }
+    if (!token || !or_key) { printf("Не найдены токены!\n"); return 1; }
 
     long update_id = 0;
-    printf("C-Bot запущен и слушает Telegram...\n");
+    printf("C-Bot запущен...\n");
 
     while(1) {
         char url[512];
@@ -148,20 +169,30 @@ int main() {
                 cJSON_ArrayForEach(item, result) {
                     update_id = cJSON_GetObjectItem(item, "update_id")->valuedouble + 1;
                     cJSON *msg = cJSON_GetObjectItem(item, "message");
+                    
                     if (msg && cJSON_GetObjectItem(msg, "text")) {
                         const char *text = cJSON_GetObjectItem(msg, "text")->valuestring;
-                        long chat_id = cJSON_GetObjectItem(cJSON_GetObjectItem(msg, "chat"), "id")->valuedouble;
+                        long chat_id = (long)cJSON_GetObjectItem(cJSON_GetObjectItem(msg, "chat"), "id")->valuedouble;
                         
-                        printf("Запрос: %s\n", text);
+                        printf("\n[ВОПРОС]: %s\n", text);
                         char *sql = generate_sql(text, or_key);
+                        
                         if (sql) {
-                            printf("Сгенерирован SQL: %s\n", sql);
                             char *db_res = execute_sql(sql);
                             if (db_res) {
-                                send_message(token, chat_id, db_res);
+                                if (is_numeric(db_res)) {
+                                    printf("[ОТВЕТ]: %s (Отправлено)\n", db_res);
+                                    send_message(token, chat_id, db_res);
+                                } else {
+                                    printf("[ЗАБЛОКИРОВАНО]: Ответ '%s' не является числом.\n", db_res);
+                                }
                                 free(db_res);
+                            } else {
+                                printf("[ЗАБЛОКИРОВАНО]: БД вернула пустоту.\n");
                             }
                             free(sql);
+                        } else {
+                            printf("[ЗАБЛОКИРОВАНО]: LLM выдала IGNORE на оффтоп.\n");
                         }
                     }
                 }
